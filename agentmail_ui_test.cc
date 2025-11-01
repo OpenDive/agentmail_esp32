@@ -11,7 +11,8 @@
 #include "board.h"
 #include "display/display.h"
 #include "system_info.h"
-#include "settings.h"
+#include "wifi_station.h"
+#include "ssid_manager.h"
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -339,12 +340,43 @@ void start_agentmail_ui_test() {
     
     // Get board instance
     auto& board = Board::GetInstance();
-    auto& settings = Settings::GetInstance();
     
     ESP_LOGI(TAG, "Device Information:");
     ESP_LOGI(TAG, "  Board: %s", board.GetBoardType().c_str());
     ESP_LOGI(TAG, "  UUID: %s", board.GetUuid().c_str());
     ESP_LOGI(TAG, "  MAC: %s", SystemInfo::GetMacAddress().c_str());
+    ESP_LOGI(TAG, "");
+    
+    // Initialize WiFi/Network
+    ESP_LOGI(TAG, "Connecting to WiFi...");
+    
+    // Check if WiFi credentials are configured
+    auto& ssid_manager = SsidManager::GetInstance();
+    auto ssid_list = ssid_manager.GetSsidList();
+    
+    if (ssid_list.empty()) {
+        ESP_LOGE(TAG, "No WiFi configured!");
+        ESP_LOGE(TAG, "Please configure WiFi first using normal app mode.");
+        ESP_LOGE(TAG, "Test will restart in 30 seconds...");
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        esp_restart();
+        return;
+    }
+    
+    // Let WifiStation handle all WiFi initialization
+    auto& wifi_station = WifiStation::GetInstance();
+    wifi_station.Start();
+    
+    if (!wifi_station.WaitForConnected(60 * 1000)) {
+        ESP_LOGE(TAG, "WiFi connection failed!");
+        ESP_LOGE(TAG, "Check credentials and network availability.");
+        ESP_LOGE(TAG, "Test will restart in 30 seconds...");
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        esp_restart();
+        return;
+    }
+    
+    ESP_LOGI(TAG, "✓ WiFi connected");
     ESP_LOGI(TAG, "");
     
     // Check for display
@@ -385,7 +417,7 @@ void start_agentmail_ui_test() {
 #ifdef CONFIG_AGENTMAIL_API_KEY
     std::string api_key = CONFIG_AGENTMAIL_API_KEY;
 #else
-    std::string api_key = settings.GetString("agentmail_api_key");
+    std::string api_key = "";
 #endif
     
     if (api_key.empty()) {

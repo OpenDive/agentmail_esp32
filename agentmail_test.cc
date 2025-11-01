@@ -11,7 +11,8 @@
 #include "board.h"
 #include "display/display.h"
 #include "system_info.h"
-#include "settings.h"
+#include "wifi_station.h"
+#include "ssid_manager.h"
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -133,7 +134,6 @@ void start_agentmail_test() {
     
     // Get board instance
     auto& board = Board::GetInstance();
-    auto& settings = Settings::GetInstance();
     
     ESP_LOGI(TAG, "Device Information:");
     ESP_LOGI(TAG, "  Board: %s", board.GetBoardType().c_str());
@@ -141,22 +141,34 @@ void start_agentmail_test() {
     ESP_LOGI(TAG, "  MAC: %s", SystemInfo::GetMacAddress().c_str());
     ESP_LOGI(TAG, "");
     
-    // Check WiFi connection
+    // Initialize WiFi/Network
     ESP_LOGI(TAG, "Pre-flight checks:");
-    ESP_LOGI(TAG, "  Checking WiFi connection...");
+    ESP_LOGI(TAG, "  Connecting to WiFi...");
     
-    // Give WiFi time to connect if just started
-    int wifi_wait = 0;
-    while (wifi_wait < 30) {
-        // In real implementation, check actual WiFi status
-        // For now, we'll assume WiFi is handled by main app
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        wifi_wait++;
-        
-        // Assume connected after waiting
-        if (wifi_wait >= 5) {
-            break;
-        }
+    // Check if WiFi credentials are configured
+    auto& ssid_manager = SsidManager::GetInstance();
+    auto ssid_list = ssid_manager.GetSsidList();
+    
+    if (ssid_list.empty()) {
+        ESP_LOGE(TAG, "❌ No WiFi configured!");
+        ESP_LOGE(TAG, "  Please configure WiFi first using normal app mode.");
+        ESP_LOGE(TAG, "Test FAILED. Device will restart in 30 seconds...");
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        esp_restart();
+        return;
+    }
+    
+    // Let WifiStation handle all WiFi initialization
+    auto& wifi_station = WifiStation::GetInstance();
+    wifi_station.Start();
+    
+    if (!wifi_station.WaitForConnected(60 * 1000)) {
+        ESP_LOGE(TAG, "❌ WiFi connection failed!");
+        ESP_LOGE(TAG, "  Check credentials and network availability.");
+        ESP_LOGE(TAG, "Test FAILED. Device will restart in 30 seconds...");
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        esp_restart();
+        return;
     }
     
     ESP_LOGI(TAG, "  ✓ WiFi connected");
@@ -168,19 +180,16 @@ void start_agentmail_test() {
 #ifdef CONFIG_AGENTMAIL_API_KEY
     std::string api_key = CONFIG_AGENTMAIL_API_KEY;
 #else
-    std::string api_key = settings.GetString("agentmail_api_key");
+    std::string api_key = "";
 #endif
     
     if (api_key.empty()) {
         ESP_LOGE(TAG, "❌ FAILED: No API key configured!");
         ESP_LOGE(TAG, "");
         ESP_LOGE(TAG, "Please configure API key:");
-        ESP_LOGE(TAG, "  Option 1: idf.py menuconfig");
+        ESP_LOGE(TAG, "  idf.py menuconfig");
         ESP_LOGE(TAG, "    → AgentMail Configuration");
         ESP_LOGE(TAG, "    → AgentMail API Key");
-        ESP_LOGE(TAG, "");
-        ESP_LOGE(TAG, "  Option 2: Runtime settings");
-        ESP_LOGE(TAG, "    settings.SetString(\"agentmail_api_key\", \"your_key\")");
         ESP_LOGE(TAG, "");
         ESP_LOGE(TAG, "Test FAILED. Device will restart in 30 seconds...");
         vTaskDelay(pdMS_TO_TICKS(30000));

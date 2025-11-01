@@ -42,6 +42,48 @@ typedef struct {
 } http_response_t;
 
 /**
+ * URL encode a string (specifically handles @ symbol in email addresses)
+ * Returns a newly allocated string that must be freed by caller
+ */
+static char* url_encode(const char* str) {
+    if (str == NULL) return NULL;
+    
+    // Count how many special chars need encoding
+    size_t len = strlen(str);
+    size_t encoded_len = len;
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] == '@' || str[i] == '+' || str[i] == '/') {
+            encoded_len += 2; // Each special char becomes %XX (3 chars total)
+        }
+    }
+    
+    char* encoded = (char*)malloc(encoded_len + 1);
+    if (encoded == NULL) return NULL;
+    
+    size_t pos = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] == '@') {
+            encoded[pos++] = '%';
+            encoded[pos++] = '4';
+            encoded[pos++] = '0';
+        } else if (str[i] == '+') {
+            encoded[pos++] = '%';
+            encoded[pos++] = '2';
+            encoded[pos++] = 'B';
+        } else if (str[i] == '/') {
+            encoded[pos++] = '%';
+            encoded[pos++] = '2';
+            encoded[pos++] = 'F';
+        } else {
+            encoded[pos++] = str[i];
+        }
+    }
+    encoded[pos] = '\0';
+    
+    return encoded;
+}
+
+/**
  * HTTP event handler for accumulating response data
  */
 static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
@@ -119,17 +161,16 @@ static agentmail_err_t perform_http_request(
     response->size = 0;
 
     // Configure HTTP client
-    esp_http_client_config_t http_config = {
-        .url = url,
-        .timeout_ms = client->timeout_ms,
-        .event_handler = http_event_handler,
-        .user_data = response,
-        .buffer_size = 2048,
-        .buffer_size_tx = 2048,
+    esp_http_client_config_t http_config = {};
+    http_config.url = url;
+    http_config.timeout_ms = client->timeout_ms;
+    http_config.event_handler = http_event_handler;
+    http_config.user_data = response;
+    http_config.buffer_size = 2048;
+    http_config.buffer_size_tx = 2048;
 #ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-        .crt_bundle_attach = esp_crt_bundle_attach,
+    http_config.crt_bundle_attach = esp_crt_bundle_attach;
 #endif
-    };
 
     esp_http_client_handle_t http_client = esp_http_client_init(&http_config);
     if (http_client == NULL) {
@@ -386,28 +427,28 @@ agentmail_err_t agentmail_inbox_get(
     }
 
     // Extract inbox info from v0 API response
-    cJSON *inbox_id = cJSON_GetObjectItem(res_json, "inbox_id");
-    cJSON *address = cJSON_GetObjectItem(res_json, "address");
-    cJSON *name = cJSON_GetObjectItem(res_json, "name");
-    cJSON *created_at = cJSON_GetObjectItem(res_json, "created_at");
-    cJSON *metadata = cJSON_GetObjectItem(res_json, "metadata");
+    cJSON *json_inbox_id = cJSON_GetObjectItem(res_json, "inbox_id");
+    cJSON *json_address = cJSON_GetObjectItem(res_json, "address");
+    cJSON *json_name = cJSON_GetObjectItem(res_json, "name");
+    cJSON *json_created_at = cJSON_GetObjectItem(res_json, "created_at");
+    cJSON *json_metadata = cJSON_GetObjectItem(res_json, "metadata");
 
-    if (cJSON_IsString(inbox_id)) {
-        inbox->inbox_id = strdup(inbox_id->valuestring);
+    if (cJSON_IsString(json_inbox_id)) {
+        inbox->inbox_id = strdup(json_inbox_id->valuestring);
     }
-    if (cJSON_IsString(address)) {
-        inbox->email_address = strdup(address->valuestring);
+    if (cJSON_IsString(json_address)) {
+        inbox->email_address = strdup(json_address->valuestring);
     }
-    if (cJSON_IsString(name)) {
-        inbox->name = strdup(name->valuestring);
+    if (cJSON_IsString(json_name)) {
+        inbox->name = strdup(json_name->valuestring);
     }
-    if (cJSON_IsString(created_at)) {
-        inbox->created_at = strdup(created_at->valuestring);
+    if (cJSON_IsString(json_created_at)) {
+        inbox->created_at = strdup(json_created_at->valuestring);
     }
-    if (cJSON_IsString(metadata)) {
-        inbox->metadata = strdup(metadata->valuestring);
-    } else if (cJSON_IsObject(metadata)) {
-        char *metadata_str = cJSON_PrintUnformatted(metadata);
+    if (cJSON_IsString(json_metadata)) {
+        inbox->metadata = strdup(json_metadata->valuestring);
+    } else if (cJSON_IsObject(json_metadata)) {
+        char *metadata_str = cJSON_PrintUnformatted(json_metadata);
         if (metadata_str) {
             inbox->metadata = metadata_str;
         }
@@ -657,9 +698,15 @@ agentmail_err_t agentmail_send(
         return AGENTMAIL_ERR_NO_MEM;
     }
 
-    // Build v0 API path: /inboxes/:inbox_id/messages/send
+    // Build v0 API path: /inboxes/:inbox_id/messages/send (URL encode inbox_id)
+    char* encoded_inbox_id = url_encode(options->from);
+    if (encoded_inbox_id == NULL) {
+        free(payload);
+        return AGENTMAIL_ERR_NO_MEM;
+    }
+    
     char path[512];
-    snprintf(path, sizeof(path), "/inboxes/%s/messages/send", options->from);
+    snprintf(path, sizeof(path), "/inboxes/%s/messages/send", encoded_inbox_id);
 
     // Perform request
     http_response_t response = {};
@@ -668,6 +715,7 @@ agentmail_err_t agentmail_send(
         client, "POST", path, payload, &response, &status_code
     );
     free(payload);
+    free(encoded_inbox_id);
 
     if (err != AGENTMAIL_ERR_NONE) {
         free(response.buffer);
@@ -704,11 +752,17 @@ agentmail_err_t agentmail_messages_get(
     agentmail_client_t *client = (agentmail_client_t *)handle;
     memset(messages, 0, sizeof(agentmail_message_list_t));
 
+    // URL encode inbox_id (may contain @ symbol)
+    char* encoded_inbox_id = url_encode(inbox_id);
+    if (encoded_inbox_id == NULL) {
+        return AGENTMAIL_ERR_NO_MEM;
+    }
+
     // Build path with query params
     char path[1024];
     int limit = (query != NULL && query->limit > 0) ? query->limit : 20;
     int offset = snprintf(path, sizeof(path), "/inboxes/%s/messages?limit=%d", 
-                          inbox_id, limit);
+                          encoded_inbox_id, limit);
     
     if (query != NULL) {
         if (query->cursor != NULL) {
@@ -731,6 +785,8 @@ agentmail_err_t agentmail_messages_get(
     agentmail_err_t err = perform_http_request(
         client, "GET", path, NULL, &response, &status_code
     );
+
+    free(encoded_inbox_id); // Free URL-encoded string
 
     if (err != AGENTMAIL_ERR_NONE) {
         free(response.buffer);
@@ -762,26 +818,25 @@ agentmail_err_t agentmail_messages_get(
                     cJSON *item = cJSON_GetArrayItem(data, i);
                     agentmail_message_t *msg = &messages->messages[i];
                     
-                    cJSON *message_id = cJSON_GetObjectItem(item, "message_id");
-                    cJSON *thread_id = cJSON_GetObjectItem(item, "thread_id");
-                    cJSON *from = cJSON_GetObjectItem(item, "from");
-                    cJSON *to = cJSON_GetObjectItem(item, "to");
-                    cJSON *subject = cJSON_GetObjectItem(item, "subject");
-                    cJSON *text = cJSON_GetObjectItem(item, "text");
-                    cJSON *html = cJSON_GetObjectItem(item, "html");
-                    cJSON *created_at = cJSON_GetObjectItem(item, "created_at");
-                    cJSON *is_read = cJSON_GetObjectItem(item, "is_read");
-                    cJSON *labels = cJSON_GetObjectItem(item, "labels");
+                    cJSON *json_message_id = cJSON_GetObjectItem(item, "message_id");
+                    cJSON *json_thread_id = cJSON_GetObjectItem(item, "thread_id");
+                    cJSON *json_from = cJSON_GetObjectItem(item, "from");
+                    cJSON *json_to = cJSON_GetObjectItem(item, "to");
+                    cJSON *json_subject = cJSON_GetObjectItem(item, "subject");
+                    cJSON *json_text = cJSON_GetObjectItem(item, "text");
+                    cJSON *json_html = cJSON_GetObjectItem(item, "html");
+                    cJSON *json_created_at = cJSON_GetObjectItem(item, "created_at");
+                    cJSON *json_is_read = cJSON_GetObjectItem(item, "is_read");
                     
-                    if (cJSON_IsString(message_id)) msg->message_id = strdup(message_id->valuestring);
-                    if (cJSON_IsString(thread_id)) msg->thread_id = strdup(thread_id->valuestring);
-                    if (cJSON_IsString(from)) msg->from = strdup(from->valuestring);
-                    if (cJSON_IsString(to)) msg->to = strdup(to->valuestring);
-                    if (cJSON_IsString(subject)) msg->subject = strdup(subject->valuestring);
-                    if (cJSON_IsString(text)) msg->body_text = strdup(text->valuestring);
-                    if (cJSON_IsString(html)) msg->body_html = strdup(html->valuestring);
-                    if (cJSON_IsString(created_at)) msg->timestamp = strdup(created_at->valuestring);
-                    if (cJSON_IsBool(is_read)) msg->is_read = cJSON_IsTrue(is_read);
+                    if (cJSON_IsString(json_message_id)) msg->message_id = strdup(json_message_id->valuestring);
+                    if (cJSON_IsString(json_thread_id)) msg->thread_id = strdup(json_thread_id->valuestring);
+                    if (cJSON_IsString(json_from)) msg->from = strdup(json_from->valuestring);
+                    if (cJSON_IsString(json_to)) msg->to = strdup(json_to->valuestring);
+                    if (cJSON_IsString(json_subject)) msg->subject = strdup(json_subject->valuestring);
+                    if (cJSON_IsString(json_text)) msg->body_text = strdup(json_text->valuestring);
+                    if (cJSON_IsString(json_html)) msg->body_html = strdup(json_html->valuestring);
+                    if (cJSON_IsString(json_created_at)) msg->timestamp = strdup(json_created_at->valuestring);
+                    if (cJSON_IsBool(json_is_read)) msg->is_read = cJSON_IsTrue(json_is_read);
                 }
             }
         }
@@ -841,25 +896,25 @@ agentmail_err_t agentmail_message_get(
     }
 
     // Extract message info (v0 API)
-    cJSON *message_id = cJSON_GetObjectItem(res_json, "message_id");
-    cJSON *thread_id = cJSON_GetObjectItem(res_json, "thread_id");
-    cJSON *from = cJSON_GetObjectItem(res_json, "from");
-    cJSON *to = cJSON_GetObjectItem(res_json, "to");
-    cJSON *subject = cJSON_GetObjectItem(res_json, "subject");
-    cJSON *text = cJSON_GetObjectItem(res_json, "text");
-    cJSON *html = cJSON_GetObjectItem(res_json, "html");
-    cJSON *created_at = cJSON_GetObjectItem(res_json, "created_at");
-    cJSON *is_read = cJSON_GetObjectItem(res_json, "is_read");
+    cJSON *json_message_id = cJSON_GetObjectItem(res_json, "message_id");
+    cJSON *json_thread_id = cJSON_GetObjectItem(res_json, "thread_id");
+    cJSON *json_from = cJSON_GetObjectItem(res_json, "from");
+    cJSON *json_to = cJSON_GetObjectItem(res_json, "to");
+    cJSON *json_subject = cJSON_GetObjectItem(res_json, "subject");
+    cJSON *json_text = cJSON_GetObjectItem(res_json, "text");
+    cJSON *json_html = cJSON_GetObjectItem(res_json, "html");
+    cJSON *json_created_at = cJSON_GetObjectItem(res_json, "created_at");
+    cJSON *json_is_read = cJSON_GetObjectItem(res_json, "is_read");
     
-    if (cJSON_IsString(message_id)) message->message_id = strdup(message_id->valuestring);
-    if (cJSON_IsString(thread_id)) message->thread_id = strdup(thread_id->valuestring);
-    if (cJSON_IsString(from)) message->from = strdup(from->valuestring);
-    if (cJSON_IsString(to)) message->to = strdup(to->valuestring);
-    if (cJSON_IsString(subject)) message->subject = strdup(subject->valuestring);
-    if (cJSON_IsString(text)) message->body_text = strdup(text->valuestring);
-    if (cJSON_IsString(html)) message->body_html = strdup(html->valuestring);
-    if (cJSON_IsString(created_at)) message->timestamp = strdup(created_at->valuestring);
-    if (cJSON_IsBool(is_read)) message->is_read = cJSON_IsTrue(is_read);
+    if (cJSON_IsString(json_message_id)) message->message_id = strdup(json_message_id->valuestring);
+    if (cJSON_IsString(json_thread_id)) message->thread_id = strdup(json_thread_id->valuestring);
+    if (cJSON_IsString(json_from)) message->from = strdup(json_from->valuestring);
+    if (cJSON_IsString(json_to)) message->to = strdup(json_to->valuestring);
+    if (cJSON_IsString(json_subject)) message->subject = strdup(json_subject->valuestring);
+    if (cJSON_IsString(json_text)) message->body_text = strdup(json_text->valuestring);
+    if (cJSON_IsString(json_html)) message->body_html = strdup(json_html->valuestring);
+    if (cJSON_IsString(json_created_at)) message->timestamp = strdup(json_created_at->valuestring);
+    if (cJSON_IsBool(json_is_read)) message->is_read = cJSON_IsTrue(json_is_read);
 
     cJSON_Delete(res_json);
     return AGENTMAIL_ERR_NONE;
